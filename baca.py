@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-Baca — a multi-LLM "herder".
+Baca — a multi-LLM herder, themed after the Górale (Polish Highlander) trades.
 
-Fans one task out to several models in parallel (the council), optionally lets
-them critique each other, then a chairman model synthesizes a single answer.
+A baca (master shepherd) leads the seasonal drive — the *redyk* — sending the
+flock out with his *juhasi* (shepherd's assistants). Here each juhas is a large
+language model. They all work the same task in parallel; then the *gazda*
+(homestead manager) presses their work into one finished answer — the *oscypek*.
 
-Talks to every model through LiteLLM, so you can mix cloud APIs (OpenAI,
+Every model is reached through LiteLLM, so you can mix cloud APIs (OpenAI,
 Anthropic, Gemini, xAI/Grok) and local open-weight models (Ollama/vLLM) with
 the same code. No platform fee: you pay only the model APIs, or nothing if local.
 
-Usage:
-    python baca.py "Clean up the intro of my paper" --mode ensemble
-    python baca.py --file draft.md --mode council
-    echo "prompt" | python baca.py --mode ensemble
-
-Config lives in models.yaml. API keys come from the environment
+Config lives in the bacówka (models.yaml). API keys come from the environment
 (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, XAI_API_KEY).
+
+Usage:
+    python baca.py "Clean up the intro of my paper"
+    python baca.py --file draft.md --mode narada
+    echo "prompt" | python baca.py --mode redyk
 """
 import argparse
 import concurrent.futures
@@ -23,8 +25,6 @@ import os
 import sys
 import textwrap
 import time
-
-import yaml
 
 try:
     import litellm
@@ -35,10 +35,13 @@ try:
 except ImportError:
     sys.exit("litellm not installed. Run: pip install litellm")
 
+import yaml
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def load_config(path=None):
+def load_bacowka(path=None):
+    """Load the bacówka (config): the juhasi and the gazda."""
     path = path or os.path.join(HERE, "models.yaml")
     with open(path) as f:
         return yaml.safe_load(f)
@@ -62,17 +65,17 @@ def _one_call(model, messages, temperature, timeout, retries):
     raise last
 
 
-def ask(member, prompt, system=None, retries=3):
-    """Query one council member. Tries member['model'] then any member['fallbacks'].
-    Returns (name, text) or (name, '[error] ...')."""
-    name = member["name"]
+def ask_juhas(juhas, prompt, system=None, retries=3):
+    """Send one juhas (model) out with the task. Tries its model then any
+    'fallbacks'. Returns (name, text) or (name, '[error] ...')."""
+    name = juhas["name"]
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-    models = [member["model"]] + list(member.get("fallbacks", []))
-    temperature = member.get("temperature", 0.7)
-    timeout = member.get("timeout", 120)
+    models = [juhas["model"]] + list(juhas.get("fallbacks", []))
+    temperature = juhas.get("temperature", 0.7)
+    timeout = juhas.get("timeout", 120)
     last = None
     for model in models:
         try:
@@ -83,12 +86,13 @@ def ask(member, prompt, system=None, retries=3):
     return name, f"[error] {type(last).__name__}: {last}"
 
 
-def fan_out(members, prompt, system=None):
-    """Query all enabled members in parallel. Returns dict name -> text."""
-    enabled = [m for m in members if m.get("enabled", True)]
+def redyk(juhasi, prompt, system=None):
+    """The redyk: send every enabled juhas out on the task in parallel.
+    Returns dict name -> text."""
+    flock = [j for j in juhasi if j.get("enabled", True)]
     out = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(enabled))) as ex:
-        futures = {ex.submit(ask, m, prompt, system): m for m in enabled}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(flock))) as ex:
+        futures = {ex.submit(ask_juhas, j, prompt, system): j for j in flock}
         for fut in concurrent.futures.as_completed(futures):
             name, text = fut.result()
             out[name] = text
@@ -96,14 +100,12 @@ def fan_out(members, prompt, system=None):
 
 
 def format_answers(answers):
-    blocks = []
-    for name, text in answers.items():
-        blocks.append(f"### {name}\n{text}")
-    return "\n\n".join(blocks)
+    return "\n\n".join(f"### {name}\n{text}" for name, text in answers.items())
 
 
-def critique_round(members, prompt, answers):
-    """Each member sees the others' (anonymized) answers and critiques/improves."""
+def narada(juhasi, prompt, answers):
+    """A narada (deliberation): each juhas sees the others' anonymized drafts,
+    critiques them, and returns an improved answer."""
     labeled = {f"Answer {i+1}": t for i, t in enumerate(answers.values())}
     pool = "\n\n".join(f"### {k}\n{v}" for k, v in labeled.items())
     crit_prompt = textwrap.dedent(f"""\
@@ -115,13 +117,14 @@ def critique_round(members, prompt, answers):
 
         {pool}
     """)
-    return fan_out(members, crit_prompt)
+    return redyk(juhasi, crit_prompt)
 
 
-def synthesize(chairman, prompt, answers):
+def press_oscypek(gazda, prompt, answers):
+    """The gazda presses the juhasi's work into one finished answer — the oscypek."""
     pool = format_answers(answers)
     syn_prompt = textwrap.dedent(f"""\
-        You are the chairman of a panel of AI models. The original task was:
+        You are the gazda — the head of a panel of AI models. The original task was:
 
         {prompt}
 
@@ -134,38 +137,41 @@ def synthesize(chairman, prompt, answers):
         Do not mention the panel or that multiple models were involved. Just give
         the final answer.
     """)
-    _, text = ask(chairman, syn_prompt)
+    _, text = ask_juhas(gazda, syn_prompt)
     return text
 
 
 def run(prompt, mode, cfg):
-    members = cfg["council"]
-    chairman = cfg["chairman"]
+    juhasi = cfg["juhasi"]
+    gazda = cfg["gazda"]
     system = cfg.get("system")
 
-    print(f"[baca] fanning out to {len([m for m in members if m.get('enabled', True)])} models...", file=sys.stderr)
-    answers = fan_out(members, prompt, system)
+    n = len([j for j in juhasi if j.get("enabled", True)])
+    print(f"[baca] sending the redyk out to {n} juhasi...", file=sys.stderr)
+    answers = redyk(juhasi, prompt, system)
 
-    if mode == "council":
-        print("[baca] critique round...", file=sys.stderr)
-        answers = critique_round(members, prompt, answers)
+    if mode == "narada":
+        print("[baca] narada — the juhasi critique each other...", file=sys.stderr)
+        answers = narada(juhasi, prompt, answers)
 
-    if mode in ("ensemble", "council"):
-        print("[baca] chairman synthesizing...", file=sys.stderr)
-        return synthesize(chairman, prompt, answers)
+    if mode in ("redyk", "narada"):
+        print("[baca] the gazda presses the oscypek...", file=sys.stderr)
+        return press_oscypek(gazda, prompt, answers)
 
-    # mode == raw: just show everyone's answers
+    # mode == raw: just show every juhas's answer
     return format_answers(answers)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Baca — multi-LLM herder")
+    ap = argparse.ArgumentParser(description="Baca — a multi-LLM herder")
     ap.add_argument("prompt", nargs="?", help="The task. Or use --file, or pipe stdin.")
     ap.add_argument("--file", help="Read the task from a file.")
-    ap.add_argument("--mode", default="ensemble",
-                    choices=["ensemble", "council", "raw"],
-                    help="ensemble: fan-out + synthesize. council: + critique round. raw: show all answers.")
-    ap.add_argument("--config", help="Path to models.yaml")
+    ap.add_argument("--mode", default="redyk",
+                    choices=["redyk", "narada", "raw"],
+                    help="redyk: fan-out + gazda synthesizes (default). "
+                         "narada: + a critique round first. "
+                         "raw: show every juhas's answer, no synthesis.")
+    ap.add_argument("--config", help="Path to the bacówka (models.yaml)")
     args = ap.parse_args()
 
     if args.file:
@@ -178,7 +184,7 @@ def main():
     else:
         ap.error("Give a prompt, --file, or pipe it on stdin.")
 
-    cfg = load_config(args.config)
+    cfg = load_bacowka(args.config)
     print(run(prompt, args.mode, cfg))
 
 
